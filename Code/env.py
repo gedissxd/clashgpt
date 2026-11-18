@@ -13,20 +13,27 @@ from ultralytics import YOLO
 import gymnasium as gym
 from gymnasium import spaces
 
-from misc_functions  import get_top_corner, get_elixir
+from misc_functions  import get_top_corner, get_elixir, DEFAULT_MAX_RISE
 from hand_detection  import get_hand
 from tower_health    import get_tower_health, make_tower_state
 from tracker         import CRTracker, Detection
 from observation     import build_observation, OBS_SIZE
-from reward          import compute_reward, reward_summary
-from actions         import get_action_mask, execute_action, action_to_str
-from constants       import N_ACTIONS, WAIT_ACTION, CARD_PLACEMENTS, ACTION_INDEX_MAP, ACTION_OFFSETS, CARD_COSTS, HAND_SLOT_COORDS
+from reward          import evaluate_reward
+from actions         import get_action_mask, execute_action, action_to_str, play_card_at
+from constants       import N_ACTIONS, WAIT_ACTION, CARD_PLACEMENTS, ACTION_INDEX_MAP, ACTION_OFFSETS, CARD_COSTS
+from paths           import LBGG_WEIGHTS, SARG_WEIGHTS, check_assets
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
 
-BASE         = Path(r"C:\Users\Ezra\OneDrive\Desktop\Senior Research Project")
-LBGG_WEIGHTS = BASE / r"YOLO\LBGG\LBGG_model\train\weights\best.pt"
-SARG_WEIGHTS = BASE / r"YOLO\SARG\SARG_model\train\weights\best.pt"
+def _yolo_device():
+    """GPU 0 if CUDA is available, otherwise fall back to CPU (slow but works)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return 0
+    except ImportError:
+        pass
+    print("[WARN] CUDA not available — running YOLO on CPU (expect low FPS).")
+    return "cpu"
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -37,6 +44,11 @@ IOU_NMS          = 0.45
 HP_DELTA_THRESHOLD = 0.5
 YOLO_SKIP_FRAMES = 3
 ACTION_COOLDOWN  = 0.15
+
+# Fastest real elixir regeneration (triple elixir ≈ 1.07/s) plus margin.
+# Spike suppression allows at most this much rise per second between reads,
+# so the reading keeps up in double/triple elixir instead of lagging behind.
+ELIXIR_MAX_RATE  = 1.2
 
 # Steps to wait after a damage spell before evaluating miss/hit.
 # At ~0.3-0.5s per step this is ~2-3s — enough for arrows/snowball to land.
@@ -104,8 +116,14 @@ def _enemy_all_dead(health):
 class CREnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 0}
 
-    def __init__(self, calibration_region, render_mode=None):
+    def __init__(self, calibration_region, render_mode=None, dry_run=False):
+        """
+        calibration_region : (left, top, width, height) of the screen capture
+        render_mode        : "human" opens a live annotated window
+        dry_run            : True = perceive and decide but never click
+        """
         super().__init__()
+        self.dry_run = dry_run
 
         self.left, self.top, self.cap_w, self.cap_h = calibration_region
         self.render_mode    = render_mode
@@ -114,7 +132,9 @@ class CREnv(gym.Env):
         self.observation_space = spaces.Box(0.0, 1.0, shape=(OBS_SIZE,), dtype=np.float32)
         self.action_space      = spaces.Discrete(N_ACTIONS)
 
+        check_assets(LBGG_WEIGHTS, SARG_WEIGHTS)
         print("Loading YOLO models …")
+        self._device = _yolo_device()
         self._lbgg = YOLO(str(LBGG_WEIGHTS))
         self._sarg = YOLO(str(SARG_WEIGHTS))
         print("Models loaded.")
@@ -141,6 +161,8 @@ class CREnv(gym.Env):
         self._ep_reward:          float   = 0.0
         self._yolo_frame:         int     = 0
         self._last_elixir:        float   = 0.0
+        self._last_elixir_time:   float   = 0.0
+        self.last_key:            int     = -1
 
         # Delayed spell evaluation state
         self._pending_spell:      dict | None = None  # {card, lane, countdown}
@@ -269,19 +291,14 @@ class CREnv(gym.Env):
                 return forced_action
             else:
                 # Non-spell — direct pyautogui click, return WAIT to PPO
-                cx, cy   = self._corner
-                ox, oy   = self._capture_offset
                 tx, ty   = (134, 650) if lane == "left" else (428, 650)
                 slot_idx = next(
                     (i for i, c in enumerate(self._last_hand[:4]) if c == card),
                     None
                 )
                 if slot_idx is not None:
-                    sx, sy = HAND_SLOT_COORDS[slot_idx]
-                    import pyautogui
-                    pyautogui.click(ox + cx + sx, oy + cy + sy)
-                    time.sleep(0.05)
-                    pyautogui.click(ox + cx + tx, oy + cy + ty)
+                    play_card_at(slot_idx, (tx, ty), self._corner,
+                                 self._capture_offset, self.dry_run)
                     print(f"[barrel] EXECUTING direct — {card} at {lane} ({tx},{ty})")
                 self._barrel_intercept_state = None
                 self._barrel_intercept_lane  = None
@@ -336,9 +353,9 @@ class CREnv(gym.Env):
 
         if run_yolo:
             res_lbgg = self._lbgg.predict(game_region, conf=CONF_THRESH, iou=IOU_NMS,
-                                           verbose=False, device=0)[0]
+                                           verbose=False, device=self._device)[0]
             res_sarg = self._sarg.predict(game_region, conf=CONF_THRESH, iou=IOU_NMS,
-                                           verbose=False, device=0)[0]
+                                           verbose=False, device=self._device)[0]
             detections = []
             for res in (res_lbgg, res_sarg):
                 names = res.names
@@ -355,7 +372,11 @@ class CREnv(gym.Env):
             tracks = self._tracker.update([])
 
         hand, next_card = get_hand(frame, self._corner)
-        elixir          = get_elixir(frame, self._corner, self._last_elixir)
+        now             = time.monotonic()
+        dt              = now - self._last_elixir_time if self._last_elixir_time else 0.0
+        max_rise        = max(DEFAULT_MAX_RISE, dt * ELIXIR_MAX_RATE)
+        elixir          = get_elixir(frame, self._corner, self._last_elixir, max_rise)
+        self._last_elixir_time = now
         health, _       = get_tower_health(frame, self._corner,
                                            self._last_health, self._tower_state)
         obs  = build_observation(tracks, hand, next_card, elixir, health)
@@ -375,6 +396,7 @@ class CREnv(gym.Env):
         self._ep_reward         = 0.0
         self._yolo_frame        = 0
         self._last_elixir       = 0.0
+        self._last_elixir_time  = 0.0
         self._fallback_counters = {}
         self._tower_state       = make_tower_state()
         self._last_health       = {
@@ -438,21 +460,22 @@ class CREnv(gym.Env):
         # ── Barrel intercept override ─────────────────────────────────────────
         # Detects flying goblin_barrel, saves elixir, fires spell/cheapest card
         # when barrel lands. Overrides PPO action during the intercept sequence.
-        action = self._barrel_intercept_override(action)
+        # If the game has already ended (banner seen), don't click on the
+        # end screen — just close out the episode.
+        if self._force_done:
+            action = WAIT_ACTION
+        else:
+            action = self._barrel_intercept_override(action)
 
         # ── Execute action ────────────────────────────────────────────────────
-        if action != WAIT_ACTION:
-            info_pair = ACTION_INDEX_MAP.get(action)
-            if info_pair is not None:
-                played_card, placement_idx = info_pair
-                px = CARD_PLACEMENTS[played_card][placement_idx][0]
-                played_lane = "left" if px < 280 else "right"
-            execute_action(action, self._last_hand, self._corner, self._capture_offset)
-            # Compute placement y for reward purpose signals
-            if info_pair is not None:
-                played_y = float(CARD_PLACEMENTS[played_card][placement_idx][1])
-            else:
-                played_y = None
+        info_pair = ACTION_INDEX_MAP.get(action) if action != WAIT_ACTION else None
+        if info_pair is not None and execute_action(
+                action, self._last_hand, self._corner,
+                self._capture_offset, self.dry_run):
+            played_card, placement_idx = info_pair
+            px, py = CARD_PLACEMENTS[played_card][placement_idx]
+            played_lane = "left" if px < 280 else "right"
+            played_y    = float(py)
 
             # Start delayed spell window immediately on spell play — before
             # any frame capture so timing is wall-clock accurate.
@@ -490,7 +513,8 @@ class CREnv(gym.Env):
                 self._barrel_response_steps = None
                 self._barrel_response_side  = None
 
-            time.sleep(ACTION_COOLDOWN)
+            if not self.dry_run:
+                time.sleep(ACTION_COOLDOWN)
 
         # ── Capture next frame ────────────────────────────────────────────────
         self._yolo_frame += 1
@@ -558,7 +582,7 @@ class CREnv(gym.Env):
         terminated = self._force_done
 
         # ── Reward ────────────────────────────────────────────────────────────
-        reward = compute_reward(
+        reward, reasons = evaluate_reward(
             prev_health           = prev_health,
             curr_health           = health,
             done                  = terminated,
@@ -577,25 +601,9 @@ class CREnv(gym.Env):
             prev_tracks           = prev_tracks,
             hand                  = hand,
         )
-        rew_str = reward_summary(
-            prev_health           = prev_health,
-            curr_health           = health,
-            done                  = terminated,
-            won                   = self._won,
-            played_card           = played_card,
-            played_lane           = played_lane,
-            played_y              = played_y,
-            spell_card            = spell_card,
-            spell_lane            = spell_lane,
-            spell_disappeared_ids = spell_disappeared_ids,
-            spell_prev_map        = spell_prev_map,
-            barrel_response_steps = self._barrel_response_steps,
-            elixir                = prev_elixir,
-            tracks                = tracks,
-            prev_track_ids        = prev_track_ids,
-            prev_tracks           = prev_tracks,
-            hand                  = hand,
-        )
+        rew_str = " | ".join(reasons) if reasons else "—"
+        if reasons:
+            print(f"[reward] {reward:+.3f}  {rew_str}")
 
         # Clear barrel response — only fires on the step the spell is played
         self._barrel_response_steps = None
@@ -630,6 +638,7 @@ class CREnv(gym.Env):
             "reward_str":   rew_str,
             "ep_reward":    self._ep_reward,
             "yolo_ran":     run_yolo,
+            "won":          self._won if terminated else None,
         }
 
     def action_masks(self):
@@ -673,7 +682,7 @@ class CREnv(gym.Env):
             cv.putText(vis,line,(5,y),FONT,0.42,(255,255,255),1,cv.LINE_AA)
             y += 16
         cv.imshow("CR Agent", vis)
-        cv.waitKey(1)
+        self.last_key = cv.waitKey(1) & 0xFF   # lets callers react to keypresses
 
     def close(self):
         self._sct.close()

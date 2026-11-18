@@ -39,7 +39,7 @@ from constants import CARD_COSTS, CARD_PLACEMENTS
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-GAME_W               = 420.0
+GAME_W               = 561.0           # must match env.GAME_W (lane split is x=280)
 GAME_H               = 998.0
 BRIDGE_NORM_Y        = 430.0 / 998.0   # ≈ 0.431
 TOWER_DANGER_NORM_Y  = 0.75
@@ -73,7 +73,7 @@ class RewardWeights:
     princess_kill_bonus:            float = 1.5
 
     # ── Idle / timing ─────────────────────────────────────────────────────────
-    idle_penalty:                   float = 0.03
+    idle_penalty:                   float = -0.03  # was +0.03: rewarded idling
     wait_forced_save_bonus:         float = 0.01
     play_too_fast_penalty:          float = -0.20
 
@@ -114,8 +114,8 @@ class RewardWeights:
     ally_tower_penalty:             float = -3.0
 
     # ── Game over ─────────────────────────────────────────────────────────────
-    win_bonus:                      float = 0.0
-    loss_penalty:                   float = 0.0
+    win_bonus:                      float = 5.0
+    loss_penalty:                   float = -5.0
 
 
 WEIGHTS = RewardWeights()
@@ -185,7 +185,7 @@ def _other_lane(lane):
 
 # ── Public ────────────────────────────────────────────────────────────────────
 
-def compute_reward(
+def evaluate_reward(
     prev_health:            dict[str, float],
     curr_health:            dict[str, float],
     done:                   bool,
@@ -204,7 +204,8 @@ def compute_reward(
     prev_tracks:            list            = None,
     hand:                   list[str]       = None,
     weights:                RewardWeights   = WEIGHTS,
-) -> float:
+) -> tuple[float, list[str]]:
+    """Compute the reward and a list of human-readable reasons for it."""
 
     if tracks is None:              tracks = []
     if prev_track_ids is None:      prev_track_ids = set()
@@ -402,143 +403,20 @@ def compute_reward(
         reward += r
         log.append("WIN" if won else "LOSS")
 
-    if log:
-        print(f"[reward] {reward:+.3f}  " + " | ".join(log))
+    return float(reward), log
 
-    return float(reward)
+
+def compute_reward(*args, verbose: bool = True, **kwargs) -> float:
+    """See module docstring for arguments. Prints the reasons when verbose."""
+    reward, log = evaluate_reward(*args, **kwargs)
+    if verbose and log:
+        print(f"[reward] {reward:+.3f}  " + " | ".join(log))
+    return reward
 
 
 # ── Summary string ────────────────────────────────────────────────────────────
 
-def reward_summary(
-    prev_health:            dict[str, float],
-    curr_health:            dict[str, float],
-    done:                   bool,
-    won:                    bool,
-    played_card:            str | None      = None,
-    played_lane:            str | None      = None,
-    played_y:               float | None    = None,
-    spell_card:             str | None      = None,
-    spell_lane:             str | None      = None,
-    spell_disappeared_ids:  set             = None,
-    spell_prev_map:         dict            = None,
-    barrel_response_steps:  int | None      = None,
-    elixir:                 float           = 5.0,
-    tracks:                 list            = None,
-    prev_track_ids:         set             = None,
-    prev_tracks:            list            = None,
-    hand:                   list[str]       = None,
-    weights:                RewardWeights   = WEIGHTS,
-) -> str:
-    if tracks is None:              tracks = []
-    if prev_tracks is None:         prev_tracks = []
-    if hand is None:                hand = []
-    if prev_track_ids is None:      prev_track_ids = set()
-    if spell_disappeared_ids is None: spell_disappeared_ids = set()
-    if spell_prev_map is None:      spell_prev_map = {}
-
-    parts = []
-    delta = _hp_delta(prev_health, curr_health)
-
-    for key in _ENEMY_TOWERS:
-        dmg = -delta[key]
-        if dmg > 0:
-            parts.append(f"dealt({key[6:]}:{dmg:.1f}%)")
-    for key in _ALLY_TOWERS:
-        dmg = -delta[key]
-        if dmg > 0:
-            parts.append(f"took({key[4:]}:{dmg:.1f}%)")
-    for key in _ENEMY_TOWERS:
-        if _just_destroyed(prev_health, curr_health, key):
-            parts.append(f"TOWER_DOWN:{key}")
-    for key in _ALLY_TOWERS:
-        if _just_destroyed(prev_health, curr_health, key):
-            parts.append(f"TOWER_LOST:{key}")
-
-    # Princess kill
-    current_ids = {getattr(t, "track_id", None) for t in tracks} - {None}
-    disappeared = prev_track_ids - current_ids
-    prev_map    = {getattr(t, "track_id", None): t for t in prev_tracks}
-    prev_map.pop(None, None)
-    for tid in disappeared:
-        pt = prev_map.get(tid)
-        if pt and pt.team == "enemy" and pt.cls == "princess":
-            parts.append("PRINCESS_KILLED")
-
-    if spell_card is not None:
-        if len(spell_disappeared_ids) == 0:
-            parts.append(f"SPELL_MISS({spell_card})")
-        else:
-            for tid in spell_disappeared_ids:
-                pt = spell_prev_map.get(tid)
-                if pt is None:
-                    continue
-                if spell_lane and not _in_lane(pt, spell_lane):
-                    continue
-                if pt.cls == "goblin_barrel":
-                    _, norm_y = _troop_center(pt)
-                    if norm_y > BARREL_DANGER_NORM_Y:
-                        parts.append("BARREL_INTERCEPT")
-                if pt.cls in _GOBLIN_CLASSES:
-                    parts.append(f"spell_goblin({pt.cls})")
-                if pt.cls == "princess" and spell_card == "arrows":
-                    parts.append("SPELL_PRINCESS")
-
-    if barrel_response_steps is not None:
-        frac = max(0.0, 1.0 - (barrel_response_steps / weights.barrel_response_window))
-        if frac > 0:
-            parts.append(f"BARREL_RESPONSE(steps={barrel_response_steps})")
-
-    if played_card is None:
-        if _can_afford_any(hand, elixir):
-            parts.append("idle")
-    else:
-        cost = CARD_COSTS.get(played_card, 3)
-        if elixir < cost + ELIXIR_PATIENCE:
-            parts.append(f"too_fast({played_card}@{elixir:.1f})")
-
-    if played_card is not None and played_lane is not None:
-        if played_card != "giant" and len(tracks) == 0:
-            parts.append(f"nothing_on_screen({played_card})")
-        if played_card != "giant":
-            allies_this  = _ally_troops_in_lane(tracks, played_lane)
-            allies_other = _ally_troops_in_lane(tracks, _other_lane(played_lane))
-            if len(allies_this) == 0 and len(allies_other) > 0:
-                parts.append(f"wrong_lane({played_card})")
-        if played_card in _DEFENSIVE_UNITS:
-            approaching = _enemy_approaching_in_lane(tracks, played_lane)
-            if approaching:
-                parts.append(f"def_purpose({played_card},{len(approaching)})")
-            if played_y is not None:
-                if _DEF_GOOD_Y_MIN <= played_y <= _DEF_GOOD_Y_MAX:
-                    parts.append(f"def_good_pos(y={played_y:.0f})")
-                elif played_y >= _DEF_BAD_Y_MIN:
-                    parts.append(f"def_bad_pos(y={played_y:.0f})")
-        if played_card == "graveyard":
-            giants_ob = [
-                t for t in _troops_in_lane(tracks, "ally", played_lane, max_norm_y=BRIDGE_NORM_Y)
-                if t.cls == "giant"
-            ]
-            if giants_ob:
-                parts.append(f"GY_BRIDGE({len(giants_ob)}g)")
-            else:
-                giants_lane = [t for t in _troops_in_lane(tracks, "ally", played_lane) if t.cls == "giant"]
-                if giants_lane:
-                    parts.append(f"GY_IN_PUSH({len(giants_lane)}g)")
-                else:
-                    pushing = _troops_in_lane(tracks, "ally", played_lane, max_norm_y=0.5)
-                    if pushing:
-                        parts.append(f"GY_push({len(pushing)})")
-        if played_card != "giant":
-            allies = _troops_in_lane(tracks, "ally", played_lane)
-            giants = [t for t in allies if t.cls == "giant"]
-            if giants:
-                if played_card == "witch":
-                    parts.append("WITCH_BEHIND_GIANT")
-                else:
-                    parts.append(f"behind_giant({played_card})")
-
-    if done:
-        parts.append("WIN" if won else "LOSS")
-
-    return " | ".join(parts) if parts else "—"
+def reward_summary(*args, **kwargs) -> str:
+    """Human-readable string of which reward components fired (same args)."""
+    _, log = evaluate_reward(*args, **kwargs)
+    return " | ".join(log) if log else "—"
