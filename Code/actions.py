@@ -13,7 +13,7 @@ get_action_mask(hand, elixir)  ->  np.ndarray shape (N_ACTIONS,) dtype bool
           (b) the player has less elixir than the card's cost.
       • WAIT_ACTION is always True.
 
-execute_action(action_idx, hand, corner)  ->  bool
+execute_action(action_idx, hand, corner, capture_offset, dry_run)  ->  bool
     Translates a flat action index into PyAutoGUI clicks and executes it.
     Returns True if an actual card was played, False for wait.
     `hand`   : list[str] of length 4, left-to-right (from get_hand()).
@@ -22,7 +22,6 @@ execute_action(action_idx, hand, corner)  ->  bool
 
 import time
 import numpy as np
-import pyautogui
 
 from constants import (
     CARD_COSTS,
@@ -35,9 +34,38 @@ from constants import (
     PLAYER_DECK,
 )
 
-# PyAutoGUI safety — lower pause reduces latency during play
-pyautogui.PAUSE = 0.05
-pyautogui.FAILSAFE = True
+_pyautogui = None
+
+
+def _gui():
+    """Import PyAutoGUI lazily so the vision/reward code (and tests) can be
+    imported on machines without a display."""
+    global _pyautogui
+    if _pyautogui is None:
+        import pyautogui
+        pyautogui.PAUSE = 0.05     # lower pause reduces latency during play
+        pyautogui.FAILSAFE = True  # slam the mouse into a screen corner to abort
+        _pyautogui = pyautogui
+    return _pyautogui
+
+
+def play_card_at(
+    slot_idx: int,
+    target: tuple[int, int],
+    corner: tuple[int, int],
+    capture_offset: tuple[int, int] = (0, 0),
+    dry_run: bool = False,
+) -> None:
+    """Click hand slot `slot_idx`, then the corner-relative `target` point."""
+    if dry_run:
+        return
+    cx, cy = corner
+    ox, oy = capture_offset
+    sx, sy = HAND_SLOT_COORDS[slot_idx]
+    gui = _gui()
+    gui.click(ox + cx + sx, oy + cy + sy)
+    time.sleep(0.05)
+    gui.click(ox + cx + target[0], oy + cy + target[1])
 
 
 # ── Action mask ───────────────────────────────────────────────────────────────
@@ -81,6 +109,7 @@ def execute_action(
     hand: list[str],
     corner: tuple[int, int],
     capture_offset: tuple[int, int] = (0, 0),  # (left, top) from calibrate()
+    dry_run: bool = False,                     # True = decide but never click
 ) -> bool:
     if action_idx == WAIT_ACTION:
         return False
@@ -90,27 +119,13 @@ def execute_action(
         return False
 
     card, placement_idx = card_placement
-    cx, cy = corner
-    ox, oy = capture_offset  # screen offset of the capture region
 
-    slot_idx = None
-    for i, c in enumerate(hand[:4]):
-        if c == card:
-            slot_idx = i
-            break
-
+    slot_idx = next((i for i, c in enumerate(hand[:4]) if c == card), None)
     if slot_idx is None:
         return False
 
-    # Hand slot click — corner-relative + capture offset = screen absolute
-    sx, sy = HAND_SLOT_COORDS[slot_idx]
-    pyautogui.click(ox + cx + sx, oy + cy + sy)
-    time.sleep(0.05)
-
-    # Placement click
-    px, py = CARD_PLACEMENTS[card][placement_idx]
-    pyautogui.click(ox + cx + px, oy + cy + py)
-
+    play_card_at(slot_idx, CARD_PLACEMENTS[card][placement_idx],
+                 corner, capture_offset, dry_run)
     return True
 
 

@@ -12,16 +12,15 @@ Usage
   # Resume from specific checkpoint
   python train.py --resume --checkpoint path/to/model.zip
 
-Checkpoints are saved every CHECKPOINT_FREQ steps under:
-  .../Senior Research Project/Models/checkpoints/
+  # Skip the mouse calibration (values are printed after each calibration)
+  python train.py --region 0 40 568 1010
 
-TensorBoard logs are written to:
-  .../Senior Research Project/Models/tensorboard/
+Checkpoints are saved every CHECKPOINT_FREQ steps under  Models/checkpoints/
+TensorBoard logs are written to                         Models/tensorboard/
 
-Launch TensorBoard with:
-  tensorboard --logdir "C:/Users/Ezra/OneDrive/Desktop/Senior Research Project/Models/tensorboard"
+Launch TensorBoard with (from the repo root):
+  tensorboard --logdir Models/tensorboard
 """
-import msvcrt
 import argparse
 import time
 import glob
@@ -29,10 +28,14 @@ import os
 from pathlib import Path
 import threading
 
+try:
+    import msvcrt          # Windows-only: non-blocking keyboard for hotkeys
+except ImportError:        # other OSes: training still works, hotkeys don't
+    msvcrt = None
+
 import cv2 as cv
 import mss
 import numpy as np
-import pyautogui
 
 from sb3_contrib                     import MaskablePPO
 from sb3_contrib.common.wrappers     import ActionMasker
@@ -45,20 +48,19 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.utils   import get_linear_fn
 
 from env import CREnv
+from calibration import add_region_arg, get_region, mask_fn, unwrap
+from paths import (MODEL_DIR, CKPT_DIR, TB_DIR, FINAL_PATH,
+                   BANNER_TEMPLATE as BANNER_TEMPLATE_PATH, check_assets)
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-
-BASE        = Path(r"C:\Users\Ezra\OneDrive\Desktop\Senior Research Project")
-MODEL_DIR   = BASE / "Models"
-CKPT_DIR    = MODEL_DIR / "checkpoints"
-TB_DIR      = MODEL_DIR / "tensorboard"
-FINAL_PATH  = MODEL_DIR / "cr_agent_final"
-
-CKPT_DIR.mkdir(parents=True, exist_ok=True)
-TB_DIR.mkdir(parents=True, exist_ok=True)
-
-BANNER_TEMPLATE_PATH   = BASE / "Images" / "banner.png"
 BANNER_MATCH_THRESHOLD = 0.80
+
+
+def _default_device() -> str:
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 #
@@ -97,7 +99,7 @@ HYPERPARAMS = dict(
     vf_coef         = 0.5,
     max_grad_norm   = 0.5,
     verbose         = 1,
-    device          = "cuda",
+    device          = _default_device(),
     tensorboard_log = str(TB_DIR),
 )
 
@@ -138,38 +140,6 @@ class BannerDetector:
         result = cv.matchTemplate(gray, self._template, cv.TM_CCOEFF_NORMED)
         _, max_val, _, _ = cv.minMaxLoc(result)
         return max_val >= BANNER_MATCH_THRESHOLD
-
-
-# ── Calibration ───────────────────────────────────────────────────────────────
-
-def _countdown(msg: str, seconds: int):
-    for i in range(seconds, 0, -1):
-        print(f"\r{msg} — {i}s …", end="", flush=True)
-        time.sleep(1)
-    print()
-
-
-def calibrate() -> tuple[int, int, int, int]:
-    print("=== Calibration ===")
-    _countdown("Move mouse to TOP-LEFT corner of game", 3)
-    tl = pyautogui.position()
-    _countdown("Move mouse to BOTTOM-RIGHT corner of game", 3)
-    br = pyautogui.position()
-    left, top     = tl.x, tl.y
-    width, height = br.x - tl.x, br.y - tl.y
-    print(f"Capture region: {left},{top}  {width}×{height}px")
-    return left, top, width, height
-
-
-# ── Mask function ─────────────────────────────────────────────────────────────
-
-def _mask_fn(env) -> np.ndarray:
-    base = env
-    while hasattr(base, "env"):
-        base = base.env
-        if isinstance(base, CREnv):
-            break
-    return base.action_masks()
 
 
 # ── Entropy decay callback ────────────────────────────────────────────────────
@@ -225,10 +195,13 @@ class EpisodeStatsCallback(BaseCallback):
                 self._ep_lengths.append(self._current_ep_len)
 
                 health = info.get("health", {})
-                won = (
-                    health.get("enemy_left",  100) <= 0 or
-                    health.get("enemy_right", 100) <= 0
-                )
+                # The env reports the outcome the user typed at the banner.
+                # Fall back to a tower-based guess if the episode ended
+                # some other way.
+                won = info.get("won")
+                if won is None:
+                    won = (health.get("enemy_left",  100) <= 0 or
+                           health.get("enemy_right", 100) <= 0)
                 self._wins.append(int(won))
 
                 self.logger.record("episode/reward",         self._current_ep_reward)
@@ -240,6 +213,7 @@ class EpisodeStatsCallback(BaseCallback):
 
                 window = self._wins[-20:]   # smaller window — only ~150 games total
                 self.logger.record("episode/win_rate_20", sum(window) / len(window))
+                self.logger.record("episode/won", int(won))
 
                 self._current_ep_reward = 0.0
                 self._current_ep_len    = 0
@@ -251,7 +225,8 @@ class EpisodeStatsCallback(BaseCallback):
             self._handle_game_end()
             self._banner_cooldown = 300
 
-        return True
+        # Returning False tells SB3 to stop training cleanly.
+        return not self._pause_cb.stop_requested
 
     def _handle_game_end(self):
         self._pause_cb._pause      = True
@@ -264,17 +239,10 @@ class EpisodeStatsCallback(BaseCallback):
                 break
             print("  Please enter y or n.")
 
-        won  = (answer == "y")
-        base = self._env
-        while hasattr(base, "env"):
-            base = base.env
-        base.force_done(won=won)
-
-        self._wins.append(int(won))
-        self.logger.record("episode/win_manual", int(won))
-        window = self._wins[-20:]
-        self.logger.record("episode/win_rate_20", sum(window) / len(window))
-        self.logger.dump(self.num_timesteps)
+        won = (answer == "y")
+        # The win is recorded once, on the next step, when the env reports
+        # terminated=True with info["won"] (previously it was counted twice).
+        unwrap(self._env).force_done(won=won)
         print(f"  Logged as {'WIN' if won else 'LOSS'}.")
 
         while True:
@@ -287,7 +255,9 @@ class EpisodeStatsCallback(BaseCallback):
 
         if answer == "end":
             self._pause_cb._save_now()
-            raise KeyboardInterrupt
+            self._pause_cb.stop_requested = True
+            self._pause_cb._pause = False
+            return
 
         # Do NOT call reset() manually here — PPO calls it automatically
         # after it sees terminated=True from the force_done step.
@@ -310,12 +280,16 @@ class PauseAndSaveCallback(BaseCallback):
         self._save_path  = save_path
         self._pause      = False
         self._block_keys = False
+        self.stop_requested = False
+        if msvcrt is None:
+            print("Hotkeys unavailable on this OS — use Ctrl+C to stop (model is saved).")
+            return
         self._thread     = threading.Thread(target=self._listen, daemon=True)
         self._thread.start()
 
     def _listen(self):
         print("Hotkeys: [S] save  [P] pause/resume  [Q] quit cleanly")
-        while True:
+        while not self.stop_requested:
             if msvcrt.kbhit():
                 key = msvcrt.getwch().lower()
                 if self._block_keys:
@@ -326,8 +300,11 @@ class PauseAndSaveCallback(BaseCallback):
                     self._pause = not self._pause
                     print(f"\n{'Paused' if self._pause else 'Resumed'}")
                 elif key == 'q':
-                    self._save_now()
-                    raise KeyboardInterrupt
+                    # Raising here would only kill this background thread, so
+                    # instead flag the main loop to stop (see _on_step).
+                    print("\nQuitting after the current step …")
+                    self.stop_requested = True
+                    self._pause = False
             else:
                 time.sleep(0.05)
 
@@ -337,9 +314,9 @@ class PauseAndSaveCallback(BaseCallback):
         print(f"\n✓ Saved → {path}.zip")
 
     def _on_step(self) -> bool:
-        while self._pause:
+        while self._pause and not self.stop_requested:
             time.sleep(0.1)
-        return True
+        return not self.stop_requested
 
 
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
@@ -366,16 +343,24 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume",     action="store_true")
     parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--render", action="store_true",
+                        help="Show the live annotated vision window while training")
+    add_region_arg(parser)
     args = parser.parse_args()
 
-    region = calibrate()
+    check_assets(BANNER_TEMPLATE_PATH)
+    CKPT_DIR.mkdir(parents=True, exist_ok=True)
+    TB_DIR.mkdir(parents=True, exist_ok=True)
+
+    region = get_region(args)
 
     print("Loading banner detector …")
     banner = BannerDetector(region)
 
     print("Building environment …")
-    env = CREnv(calibration_region=region, render_mode=None)
-    env = ActionMasker(env, _mask_fn)
+    env = CREnv(calibration_region=region,
+                render_mode="human" if args.render else None)
+    env = ActionMasker(env, mask_fn)
     env = Monitor(env, filename=str(MODEL_DIR / "monitor.csv"))
 
     lr = get_linear_fn(LR_START, LR_END, 1.0) if USE_LR_SCHEDULE else LR_START
@@ -407,7 +392,6 @@ def main():
             print("No checkpoint found — starting fresh.")
         else:
             print(f"Resuming from: {ckpt_path}")
-            steps_done = _steps_from_checkpoint(ckpt_path)
             model = MaskablePPO.load(
                 str(ckpt_path),
                 env             = env,
@@ -417,6 +401,9 @@ def main():
             )
             model.learning_rate = lr
             model.ent_coef      = ENT_START
+            # The model stores its own step count — more reliable than parsing
+            # the filename (manual saves are named differently).
+            steps_done = model.num_timesteps or _steps_from_checkpoint(ckpt_path)
             resume = True
 
     if not resume:

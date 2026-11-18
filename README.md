@@ -6,6 +6,7 @@ A reinforcement learning agent that plays Clash Royale in real time on a Windows
 
 ## Table of Contents
 
+- [Quick Start](#quick-start)
 - [Overview](#overview)
 - [Project Documents](#project-documents)
 - [Architecture](#architecture)
@@ -23,6 +24,28 @@ A reinforcement learning agent that plays Clash Royale in real time on a Windows
 
 ---
 
+## Quick Start
+
+1. **Get the code and assets.** Clone this repo, then download `Images/`, `YOLO/` and `Models/` from the [Google Drive folder](https://drive.google.com/drive/folders/1zatBii3zCUWsibtnpse99O7PVHbQvDBs?usp=sharing) and put them in the repo root, next to `Code/`.
+2. **Install** (Windows, Python 3.10+):
+   ```bash
+   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+   pip install -r requirements.txt
+   ```
+3. **Open Clash Royale in an emulator** (BlueStacks / LDPlayer) in portrait mode at the same window size used during development (game area ≈ 561×998 px) and start a battle.
+4. **Check the vision first:**
+   ```bash
+   cd Code
+   python debug_cv.py
+   ```
+   Hover the mouse over the emulator's top-left corner, then bottom-right, when prompted. The script prints a `--region …` you can reuse to skip this step next time. Boxes, elixir, hand and tower HP in the `CR Agent` window should match the game. If they don't, the window size is wrong.
+5. **Let the trained agent play:** `python play.py` (or `python play.py --dry-run --render` to watch its decisions without it clicking).
+6. **Train / keep training:** `python train.py` (fresh) or `python train.py --resume`.
+
+Move the mouse into a screen corner at any time to trigger PyAutoGUI's fail-safe and stop all clicking.
+
+---
+
 ## Overview
 
 The agent runs a fixed 8-card deck against a standard opponent deck, playing entirely through screen capture and simulated mouse clicks — no game memory reading or API access. Every decision is made from pixels alone.
@@ -31,9 +54,10 @@ The agent runs a fixed 8-card deck against a standard opponent deck, playing ent
 
 **Opponent deck (tracked):** Goblin Gang, Princess, Ice Spirit, Rocket, Goblin Barrel, Knight, Log, Cannon
 
-The system operates in two modes:
+The system has three entry points:
 - `train.py` — live training loop with MaskablePPO, checkpoint saving, TensorBoard logging, and a banner detector that pauses training when a game ends to collect win/loss labels.
-- `debug_cv.py` — a live screen mirror with YOLO + SORT overlay for debugging the vision pipeline without the RL loop.
+- `play.py` — runs a trained model against real games without training it (optionally `--dry-run` so it never clicks).
+- `debug_cv.py` — a live screen mirror with YOLO + SORT overlay for debugging the vision pipeline. Never clicks, so you can play yourself.
 
 ---
 
@@ -83,20 +107,26 @@ get_top_corner()          ← anchors all pixel coords to the game window
 ## Repository Structure
 
 ```
-Senior Research Project/
+clashgpt/
 │
 ├── Code/
 │   ├── actions.py          # Action masking and PyAutoGUI execution
+│   ├── calibration.py      # Mouse calibration, --region flag, wrapper helpers
 │   ├── constants.py        # Card costs, placement coords, action-space layout
-│   ├── debug_cv.py         # Live vision debug window (no RL)
+│   ├── debug_cv.py         # Live vision debug window (never clicks)
 │   ├── env.py              # Gymnasium CREnv — wraps the full pipeline
 │   ├── hand_detection.py   # Template-matching hand reader
 │   ├── misc_functions.py   # get_top_corner(), get_elixir()
 │   ├── observation.py      # build_observation() → 202-float vector
+│   ├── paths.py            # Where Images/, YOLO/, Models/ live (CLASHGPT_ROOT)
+│   ├── play.py             # Run a trained model without training
 │   ├── reward.py           # Hybrid dense/sparse reward function
 │   ├── tracker.py          # SORT-based multi-object tracker (CRTracker)
 │   ├── tower_health.py     # Pixel-scan HP reader for all 6 towers
 │   └── train.py            # MaskablePPO training script
+│
+├── tests/                  # Offline unit tests (no emulator/GPU needed)
+├── requirements.txt
 │
 ├── Poster.pdf
 ├── Report.pdf
@@ -106,8 +136,7 @@ Senior Research Project/
 │   ├── cards_in_hand/  # 9 card template PNGs for get_hand()
 │   ├── mini_cards/     # 8 mini-card templates for next-card detection
 │   ├── test_images/    # Static game screenshots for offline testing
-│   ├── banner.png      # End-of-game banner template for BannerDetector
-│   └── elixir_blob.png # Legacy elixir reference (loaded by misc_functions)
+│   └── banner.png      # End-of-game banner template for BannerDetector
 │
 ├── YOLO/               # YOLO training data and weights (on Drive)
 │   ├── LBGG/           # "Troops & Buildings" model
@@ -130,34 +159,29 @@ The `Images/`, `YOLO/`, and `Models/` folders are too large for GitHub and are h
 
 **[Download Images, YOLO Weights & Models](https://drive.google.com/drive/folders/1zatBii3zCUWsibtnpse99O7PVHbQvDBs?usp=sharing)**
 
-After downloading, place them at:
+After downloading, put the three folders in the repository root (next to `Code/`). All paths are resolved in `Code/paths.py`, so nothing needs editing.
+
+To keep them somewhere else, point `CLASHGPT_ROOT` at the folder that contains them:
+```bash
+set CLASHGPT_ROOT=D:\ClashGPT
 ```
-C:\Users\<you>\OneDrive\Desktop\Senior Research Project\
-```
-so the paths in `env.py`, `hand_detection.py`, `misc_functions.py`, and `train.py` resolve correctly. If you want to install elsewhere, do a find-and-replace on `BASE` in those files.
+(PowerShell: `$env:CLASHGPT_ROOT = "D:\ClashGPT"`). If a file is missing, the scripts stop with a message naming it.
 
 ---
 
 ## Setup & Installation
 
-**Requirements:** Windows 10/11, Python 3.10+, CUDA-capable GPU (training uses `device="cuda"`), an Android emulator (e.g. BlueStacks or LDPlayer) running Clash Royale.
+**Requirements:** Windows 10/11, Python 3.10+, an Android emulator (e.g. BlueStacks or LDPlayer) running Clash Royale. A CUDA GPU is strongly recommended; without one everything falls back to CPU, which works but YOLO will be slow.
 
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install ultralytics
-pip install stable-baselines3 sb3-contrib
-pip install gymnasium
-pip install opencv-python
-pip install mss
-pip install pyautogui
-pip install filterpy
-pip install scipy
-pip install readchar
+pip install -r requirements.txt
 ```
 
-Or if a `requirements.txt` is present:
+Optional, to run the offline tests (works on any OS):
 ```bash
-pip install -r requirements.txt
+pip install pytest
+python -m pytest tests
 ```
 
 ---
@@ -177,21 +201,39 @@ python train.py --resume
 
 # Resume from a specific checkpoint
 python train.py --resume --checkpoint "../Models/checkpoints/cr_model_1024_steps.zip"
+
+# Skip mouse calibration / show the live vision window while training
+python train.py --resume --region 0 40 568 1010 --render
 ```
 
-**Calibration prompt** — at startup, the script asks you to mouse to the top-left corner of the game window (hold for 3 s), then the bottom-right corner (hold for 3 s). This sets the capture region. `get_top_corner()` then scans the captured frame for the characteristic dark-blue pixel at the game's top-left corner (BGR `[72, 30, 24]`, tolerance ±5) to anchor all subsequent coordinates.
+**Calibration prompt** — unless you pass `--region`, at startup, the script asks you to mouse to the top-left corner of the game window (hold for 3 s), then the bottom-right corner (hold for 3 s). This sets the capture region. `get_top_corner()` then scans the captured frame for the characteristic dark-blue pixel at the game's top-left corner (BGR `[72, 30, 24]`, tolerance ±5) to anchor all subsequent coordinates.
 
 **During training:**
 - `S` — manually save a checkpoint
 - `P` — pause / resume
 - `Q` — save and quit cleanly
 
-When the end-of-game banner is detected (template match score ≥ 0.80), training pauses and the terminal prompts for `y` (win) or `n` (loss) before asking you to start a new game and press Enter.
+Hotkeys need Windows (`msvcrt`); elsewhere use Ctrl+C, which also saves the model.
 
-**TensorBoard:**
+When the end-of-game banner is detected (template match score ≥ 0.80), training pauses and the terminal prompts for `y` (win) or `n` (loss), then `continue` or `end`, then asks you to start a new game and press Enter.
+
+**TensorBoard** (from the repo root):
 ```bash
-tensorboard --logdir "C:/Users/<you>/OneDrive/Desktop/Senior Research Project/Models/tensorboard"
+tensorboard --logdir Models/tensorboard
 ```
+Useful charts: `episode/win_rate_20`, `episode/reward`, `episode/length`.
+
+### Playing with a trained model
+
+```bash
+cd Code
+python play.py                                   # uses Models/cr_agent_final.zip
+python play.py --model ../Models/checkpoints/cr_model_1024_steps.zip
+python play.py --dry-run --render                # watch decisions, never click
+python play.py --games 5 --stochastic            # 5 games, sample actions
+```
+
+After each game you're asked whether you won and a running win rate is printed.
 
 ### Debug Vision
 
@@ -200,7 +242,7 @@ cd Code
 python debug_cv.py
 ```
 
-Opens a live OpenCV window (`CR Vision`) showing YOLO bounding boxes color-coded by team (green = ally, blue = enemy), track IDs, elixir, hand, next card, and tower HPs. Press `Q` to quit.
+Opens a live OpenCV window (`CR Agent`) showing YOLO bounding boxes color-coded by team (green = ally, red = enemy), track IDs, elixir, hand, next card, and tower HPs. Nothing is clicked. Press `Q` in the window to quit.
 
 ---
 
@@ -221,15 +263,15 @@ Key exports:
 
 ### `actions.py`
 - `get_action_mask(hand, elixir) → np.ndarray(49, bool)` — masks any card not in the current 4-card hand or whose cost exceeds current elixir. WAIT is always unmasked.
-- `execute_action(action_idx, hand, corner, capture_offset) → bool` — translates a flat action index into two PyAutoGUI clicks: first the hand slot, then the placement coordinate. Returns `False` for WAIT or unresolvable actions.
+- `execute_action(action_idx, hand, corner, capture_offset, dry_run) → bool` — translates a flat action index into two PyAutoGUI clicks: first the hand slot, then the placement coordinate. Returns `False` for WAIT or unresolvable actions. With `dry_run=True` nothing is clicked.
 - `action_to_str(action_idx) → str` — human-readable label for logging (e.g. `giant@(242,756)`).
 
 ### `misc_functions.py`
-- `get_top_corner(img) → (x, y)` — scans the captured frame pixel-by-pixel for BGR `[72, 30, 24]` (±5 tolerance), which is a fixed dark-blue pixel at the game's top-left edge. Returns the first match. This anchor is used as `corner` everywhere.
-- `get_elixir(img, corner, last_elixir) → float` — reads the elixir bar by scanning 10 fixed x-positions at `y=978` (corner-relative) in HSV. Full bar detected via a single pixel check at `x=538`. Partial bars use fractional pixel counting. Upward spikes of more than 0.15 per frame are clamped to suppress color noise.
+- `get_top_corner(img) → (x, y)` — finds the first pixel (row-major) matching BGR `[72, 30, 24]` (±5 tolerance), a fixed dark-blue pixel at the game's top-left edge. Vectorised with NumPy. This anchor is used as `corner` everywhere.
+- `get_elixir(img, corner, last_elixir, max_rise) → float` — reads the elixir bar by scanning 10 fixed x-positions at `y=978` (corner-relative) in HSV. Full bar detected via a single pixel check at `x=538`. Partial bars use fractional pixel counting. Upward jumps larger than `max_rise` are clamped to suppress color noise (no clamping when the previous value is unknown). `env.py` sets `max_rise` from the elapsed time so the reading keeps up in double/triple elixir.
 
 ### `hand_detection.py`
-- `get_hand(img, corner) → (hand: list[str], next_card: str)` — converts the frame to grayscale, crops the hand region (`y+820:y+951, x+124:x+541`), and runs `cv2.matchTemplate` (TM_CCOEFF_NORMED) against each of the 9 card templates. The top 4 spatially-separated matches (min 50px apart) are sorted left-to-right to give the 4-card hand. Next card is detected similarly against 8 mini-card templates in a separate crop (`y+930:y+986, x+29:x+75`).
+- `get_hand(img, corner) → (hand: list[str], next_card: str)` — templates are loaded once at import. Converts the frame to grayscale, crops the hand region (`y+820:y+951, x+124:x+541`), and runs `cv2.matchTemplate` (TM_CCOEFF_NORMED) against each of the 9 card templates. The top 4 spatially-separated matches (min 50px apart) are sorted left-to-right to give the 4-card hand. Next card is detected similarly against 8 mini-card templates in a separate crop (`y+930:y+986, x+29:x+75`).
 
 ### `tower_health.py`
 - `get_tower_health(img, corner, last_health, tower_state) → (results, segments)` — scans 4 princess tower HP bars and 2 king tower HP bars by walking pixel columns and matching against known health bar BGR palettes (±18 tolerance). King bars are only scanned once a princess tower on that side reaches 0. Towers confirmed dead over `KING_CONFIRM_FRAMES=3` consecutive frames are permanently locked at 0 in `tower_state["dead"]` to prevent resurrection artifacts.
@@ -245,18 +287,18 @@ Key exports:
 - `build_observation(tracks, hand, next_card, elixir, tower_health) → np.ndarray(202,)` — assembles the flat observation vector. See [Observation Space](#observation-space) below.
 
 ### `reward.py`
-- `compute_reward(...) → float` — evaluates the hybrid dense/sparse reward. See [Reward Function](#reward-function) below.
-- `reward_summary(...) → str` — human-readable string of which reward components fired, used in the render overlay.
+- `evaluate_reward(...) → (float, list[str])` — the reward and the reasons it fired. See [Reward Function](#reward-function) below.
+- `compute_reward(...)` / `reward_summary(...)` — thin wrappers returning just the number / just the reason string.
 
 ### `env.py`
-- `CREnv(calibration_region, render_mode)` — the Gymnasium environment. Loads both YOLO models on init. Runs YOLO every `YOLO_SKIP_FRAMES=3` steps (every other 2 frames reuse the last tracker state to reduce inference latency). HP noise filter suppresses tower deltas < 0.5% between steps. Spell-miss detection checks whether Arrows or Snowball caused a tower HP drop or troop count drop; if neither, fires the `spell_missed` penalty. Episode terminates when all 3 towers on either side reach 0, or when `force_done()` is called by the banner handler.
+- `CREnv(calibration_region, render_mode, dry_run)` — the Gymnasium environment. Loads both YOLO models on init (GPU if available, else CPU). Runs YOLO every `YOLO_SKIP_FRAMES=3` steps (the other frames let the tracker coast on Kalman predictions). HP noise filter suppresses tower deltas < 0.5% between steps. Spell-miss detection waits `SPELL_EVAL_STEPS=6` steps after Arrows/Snowball and fires the miss penalty if no enemy track disappeared. A goblin-barrel intercept routine can override the policy's action to defend a tower. The episode ends when `force_done()` is called by the banner handler; `info["won"]` carries the outcome.
 - `render_mode="human"` — opens a `CR Agent` OpenCV window with bounding boxes, HUD overlay, and per-step reward.
 
 ### `train.py`
 - `BannerDetector` — polls the capture region for `banner.png` via template matching every step (with a 300-step cooldown after a detection) to identify game-end screens.
 - `EpisodeStatsCallback` — logs per-episode reward, length, and tower HPs to TensorBoard. Handles the banner-detected pause flow.
-- `EntropyCoefficientCallback` — linearly decays `model.ent_coef` from 0.05 → 0.01 over the full training run (done manually per step because MaskablePPO does not accept a callable for `ent_coef`).
-- `PauseAndSaveCallback` — background keyboard listener thread for S/P/Q hotkeys.
+- `EntropyCoefficientCallback` — linearly decays `model.ent_coef` from 0.02 → 0.005 over the full training run (done manually per step because MaskablePPO does not accept a callable for `ent_coef`).
+- `PauseAndSaveCallback` — background keyboard listener thread for S/P/Q hotkeys (Windows). `Q` sets a flag that stops `model.learn()` cleanly; the final model is then saved.
 
 ---
 
@@ -290,7 +332,7 @@ If more than 30 troops are tracked, skeletons are dropped first (oldest first), 
 
 **Card classes (9, includes "empty"):** arrows, bowler, giant, graveyard, guards, minions, snowball, witch, empty
 
-Team assignment for spawned units (skeleton, goblin, spear\_goblin) uses position: `norm_y > 0.5` = ally (bottom half of arena). All other units use the `e_` prefix convention from the YOLO label names.
+Team assignment uses fixed class sets in `env.py` (`_ALLY_CLASSES` / `_ENEMY_CLASSES`), since each deck's units are known.
 
 ---
 
@@ -318,59 +360,62 @@ The action mask zeros out any card not currently in the 4-card hand or whose eli
 
 ## Reward Function
 
-Hybrid dense + sparse design. All weights live in `RewardWeights` in `reward.py` and can be tuned without touching logic.
+Hybrid dense + sparse design. All weights live in `RewardWeights` in `reward.py` and can be tuned without touching logic. Every step's reasons are printed as `[reward] …` and shown in the render overlay.
 
 ### Dense (every step)
 
-| Signal | Weight | Notes |
-|--------|--------|-------|
-| Enemy tower HP lost (per 1%) | +0.01 | Encourages attacking |
-| Ally tower HP lost (per 1%) | −0.02 | Penalises taking damage (higher weight than offense) |
-| Ally troop in enemy half — depth bonus | +0.003 × depth | Positional pressure per troop per step |
-| Enemy troop in ally half — depth penalty | −0.003 × depth | Discourages letting troops through |
-
-Depth is `0.5 − norm_y` for ally troops in the enemy half, and `norm_y − 0.5` for enemy troops in the ally half, where `norm_y=0` is the top of the arena (enemy side).
+| Signal | Weight |
+|--------|--------|
+| Enemy princess tower HP lost (per 1%) | +0.02 |
+| Ally princess tower HP lost (per 1%) | −0.04 |
+| Enemy troop deep in our half (`norm_y > 0.75`) | −0.01 × depth past 0.75 |
+| WAIT while a card in hand is affordable | −0.03 |
+| WAIT while nothing is affordable and elixir < 4 | +0.01 |
 
 ### Sparse (event-triggered)
 
 | Event | Reward |
 |-------|--------|
-| Enemy tower destroyed | +2.0 |
-| Ally tower destroyed | −2.0 |
-| Win | +5.0 |
-| Loss | −5.0 |
-| Spell (Arrows/Snowball) missed | −0.3 |
-| Card played at elixir ≥ 7 | +0.05 (efficiency bonus) |
-| Card played at elixir < 3 | −0.15 (spam penalty) |
-| WAIT when elixir ≥ 8 and cards available | −0.05 (hoarding penalty) |
-| WAIT when can't afford anything and elixir < 4 | +0.02 (saving bonus) |
-| Any non-giant played into a lane with a friendly giant | +0.4 base + 0.1 per additional ally in that lane |
-| Graveyard played with allies already in enemy half of that lane | +1.5 |
+| Win / loss (from banner prompt) | +5.0 / −5.0 |
+| Enemy / ally princess tower destroyed | +3.0 / −3.0 |
+| Enemy Princess track disappears | +1.5 |
+| Card played with elixir < cost + 1.5 | −0.2 |
+| Non-giant card played onto an empty board | −0.5 |
+| Non-giant played into an empty lane while the other lane has allies | −0.5 |
+| Defensive unit (bowler/witch/guards/minions) played with enemies approaching in that lane | +0.5 per enemy |
+| Defensive unit placed at y 450–560 / y ≥ 700 | +0.5 / −0.5 |
+| Graveyard with a giant over the bridge in that lane | +10.0 |
+| Graveyard with a giant in that lane (not yet over bridge) | +5.0 |
+| Graveyard with any ally in the enemy half of that lane | +2.0 |
+| Witch played in a lane with a friendly giant | +2.0 |
+| Other card played in a lane with a friendly giant | +0.5 + 0.1 per supporting troop |
+| Spell (Arrows/Snowball) missed | −5.0 |
+| Spell killed goblins / Arrows killed Princess | +0.4 each / +2.0 |
+| Spell intercepted a goblin barrel near our tower | +5.0 |
+| Spell at tower after a barrel landed (scaled by speed) | up to +6.0 |
 
-The push bonuses are designed to teach the agent the core Giant–Graveyard combo: place the Giant first, let it advance, then drop the Graveyard when the Giant is in the enemy half.
-
----
+The push bonuses teach the core Giant–Graveyard combo: place the Giant first, let it advance, then drop the Graveyard when the Giant is over the bridge.
 
 ## Training Details
 
 | Hyperparameter | Value | Rationale |
 |---------------|-------|-----------|
 | Algorithm | MaskablePPO (sb3-contrib) | Handles discrete action masking natively |
-| `n_steps` | 512 | One gradient update per ~10–15 min of real play (~2–3 s/step) |
-| `batch_size` | 128 | 4 minibatches per rollout for clean gradients |
+| `n_steps` | 128 | Several updates per game — critical when only ~100 games are played |
+| `batch_size` | 64 | 2 minibatches per rollout |
 | `n_epochs` | 10 | |
 | `gamma` | 0.97 | ~33-step effective horizon; matches card→tower-damage delay |
 | `gae_lambda` | 0.95 | |
 | `clip_range` | 0.2 | |
-| `ent_coef` | 0.05 → 0.01 (linear) | High early entropy prevents wait-spam collapse |
-| `learning_rate` | 3e-4 → 1e-5 (linear) | |
+| `ent_coef` | 0.02 → 0.005 (linear) | Enough early entropy to prevent collapse, low enough to exploit quickly |
+| `learning_rate` | 5e-4 → 1e-5 (linear) | |
 | `vf_coef` | 0.5 | |
 | `max_grad_norm` | 0.5 | |
-| `device` | cuda | |
+| `device` | cuda (cpu fallback) | |
 | Total timesteps | 1,000,000 | |
-| Checkpoint frequency | every 512 steps | Saved to `Models/checkpoints/` |
+| Checkpoint frequency | every 128 steps | Saved to `Models/checkpoints/` |
 
-Checkpoints are named `cr_model_<N>_steps.zip`. The resume flag (`--resume`) auto-detects the most recent checkpoint by file modification time and extracts the step count from the filename to correctly offset `total_timesteps`.
+Checkpoints are named `cr_model_<N>_steps.zip` (manual `S` saves: `manual_save_<N>steps.zip`). `--resume` picks the most recently modified checkpoint and continues from the step count stored inside the model, so the LR/entropy schedules pick up where they left off.
 
 ---
 
@@ -380,20 +425,20 @@ Checkpoints are named `cr_model_<N>_steps.zip`. The resume flag (`--resume`) aut
 All pixel coordinates throughout the codebase are stored as offsets from a `corner = (x, y)` anchor. `get_top_corner()` finds this anchor by scanning for the fixed dark-blue border pixel at the top-left of the game UI (BGR `[72, 30, 24]`, ±5). This means the code works regardless of where the emulator window is positioned on screen.
 
 ### YOLO Models
-Two YOLOv11 models run in parallel on the cropped game region (420×1000 px), with results merged before the tracker:
+Two YOLOv11 models run on the cropped game region (561×998 px), with results merged before the tracker:
 - **LBGG** (`best.pt` in `YOLO/LBGG/`) — detects troops and buildings
 - **SARG** (`best.pt` in `YOLO/SARG/`) — detects spells and projectiles
 
 Inference threshold: `conf=0.35`, `iou=0.45`. YOLO runs every 3rd frame (`YOLO_SKIP_FRAMES=3`); on skipped frames the tracker coasts on its Kalman predictions.
 
 ### SORT Tracker
-Two independent SORT pools (ally/enemy) with a class-consistency check: detections can only match tracks of the same class. Parameters: `max_age=8`, `min_hits=2`, `iou_threshold=0.25`. The 7-state Kalman filter tracks `[x_c, y_c, area, aspect_ratio, vx, vy, v_area]`.
+Two independent SORT pools (ally/enemy) with a class-consistency check: detections can only match tracks of the same class. Parameters (as used by `CREnv`): `max_age=4`, `min_hits=2`, `iou_threshold=0.25`. The 7-state Kalman filter tracks `[x_c, y_c, area, aspect_ratio, vx, vy, v_area]`.
 
 ### Hand Detection
 Template matching (TM_CCOEFF_NORMED) against 9 reference PNGs in `Images/cards_in_hand/`. The top 4 matches with centres at least 50 px apart (left-to-right order) identify the current hand. Next card uses 8 mini-card templates in `Images/mini_cards/`.
 
 ### Elixir Reading
-10 fixed pixel positions along the elixir bar are sampled in HSV. Each full-bar pixel scores +1 elixir; partial-bar pixels use sub-pixel interpolation over a 39-pixel scan window to give fractional elixir values. Upward spikes > 0.15 per frame are clamped.
+10 fixed pixel positions along the elixir bar are sampled in HSV. Each full-bar pixel scores +1 elixir; partial-bar pixels use sub-pixel interpolation over a 39-pixel scan window to give fractional elixir values. Upward spikes faster than 1.2 elixir/second (just above triple-elixir regen) are clamped.
 
 ### Tower Health Reading
 HP bars are scanned column-by-column in BGR, matching against known palette colors (±18 tolerance). Princess bars stop scanning on a "terminate" color (the empty bar edge). King bars are only activated once a princess tower on that side falls. A 3-frame confirmation window prevents single noisy frames from declaring towers dead prematurely.
@@ -402,8 +447,9 @@ HP bars are scanned column-by-column in BGR, matching against known palette colo
 
 ## Known Limitations
 
-- **Windows only** — uses `mss` for screen capture, `pyautogui` for input, and `msvcrt` for keyboard hotkeys.
+- **Windows-focused** — developed on Windows. Training hotkeys use `msvcrt` (Windows only; elsewhere use Ctrl+C).
 - **Fixed emulator resolution** — all pixel coordinates assume the emulator is running at the specific resolution captured during development. Rescaling the window will break hand detection, elixir reading, and tower health scanning.
 - **Manual game reset** — the agent does not navigate Clash Royale menus. A human must start each game and press Enter in the terminal when the game is ready.
 - **No opponent modeling** — the opponent's deck is tracked by YOLO but not explicitly used in strategy beyond positional awareness.
 - **Single environment** — training runs in a single non-vectorized environment, so sample efficiency is limited by real-time game speed (~2–3 s/step).
+- **Scripted barrel defense is off-policy** — when the goblin-barrel intercept overrides the policy's action, PPO still records the action it originally chose, so those steps are slightly mislabeled in the rollout.
